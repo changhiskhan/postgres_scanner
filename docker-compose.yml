@@ -1,0 +1,16 @@
+version: "3.9"
+services:
+  db:
+    build:
+      dockerfile: Dockerfile
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: trust
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: db
+    volumes:
+      - ./docker-entrypoint-initdb.d:/docker-entrypoint-initdb.d
+    ports:
+      - "5432:5432"
+volumes:
+  db-volume: null
