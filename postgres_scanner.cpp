@@ -194,9 +194,11 @@ static LogicalType DuckDBType(PostgresColumnInfo &info, PGconn *conn) {
 		return LogicalType::TIMESTAMP;
 	} else if (pgtypename == "timestamptz") {
 		return LogicalType::TIMESTAMP_TZ;
-	} else {
-		throw IOException("Unsupported Postgres type %s", pgtypename);
-	}
+	} else if (pgtypename == "vector") {
+    return LogicalTypeId::LIST;
+  } else {
+    throw IOException("Unsupported Postgres type %s", pgtypename);
+  }
 }
 
 static unique_ptr<FunctionData> PostgresBind(ClientContext &context, TableFunctionBindInput &input,
@@ -212,7 +214,7 @@ static unique_ptr<FunctionData> PostgresBind(ClientContext &context, TableFuncti
 
 	// we create a transaction here, and get the snapshot id so the parallel
 	// reader threads can use the same snapshot
-	PGExec(bind_data->conn, "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY");
+  PGExec(bind_data->conn, "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY");
 
 	bind_data->in_recovery = (bool)PGQuery(bind_data->conn, "SELECT pg_is_in_recovery()")->GetBool(0, 0);
 	bind_data->snapshot = "";
@@ -271,6 +273,96 @@ ORDER BY attnum
 	names = bind_data->names;
 
 	return move(bind_data);
+}
+
+static unique_ptr<FunctionData> PGVectorBind(ClientContext &context, TableFunctionBindInput &input,
+                                             vector<LogicalType> &return_types, vector<string> &names) {
+  auto dsn = input.inputs[0].GetValue<string>();
+  auto conn = PGConnect(dsn);
+  auto schema_name = input.inputs[1].GetValue<string>();
+  auto table_name = input.inputs[2].GetValue<string>();
+  auto id = input.inputs[3].GetValue<string>();
+
+  // TODO generate uuid
+  auto result_table_name = "__results__";
+  PGExec(conn, StringUtil::Format("DROP TABLE IF EXISTS %s;", result_table_name));
+
+  auto inner_query = StringUtil::Format("SELECT %s FROM %s.%s WHERE %s='%s'",
+                                        "embedding", schema_name, table_name, "id", id);
+  auto similarity = StringUtil::Format("1 - cosine_distance(%s, (%s))", "embedding", inner_query);
+  auto select = StringUtil::Format("SELECT %s, %s, %s as score FROM %s.%s", "id", "label",
+                                   similarity, schema_name, table_name);
+  auto query = StringUtil::Format("CREATE TABLE IF NOT EXISTS %s.%s AS (%s);", schema_name, result_table_name, select);
+  PGExec(conn, query);
+
+  auto bind_data = make_unique<PostgresBindData>();
+  bind_data->dsn = input.inputs[0].GetValue<string>();
+  bind_data->schema_name = input.inputs[1].GetValue<string>();
+  bind_data->table_name = result_table_name;
+
+  bind_data->conn = PGConnect(bind_data->dsn);
+
+  // we create a transaction here, and get the snapshot id so the parallel
+  // reader threads can use the same snapshot
+  PGExec(bind_data->conn, "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY");
+
+  bind_data->in_recovery = (bool)PGQuery(bind_data->conn, "SELECT pg_is_in_recovery()")->GetBool(0, 0);
+  bind_data->snapshot = "";
+
+  if (!bind_data->in_recovery) {
+    bind_data->snapshot = PGQuery(bind_data->conn, "SELECT pg_export_snapshot()")->GetString(0, 0);
+  }
+
+  // find the id of the table in question to simplify below queries and avoid
+  // complex joins (ha)
+  auto res = PGQuery(bind_data->conn, StringUtil::Format(R"(
+SELECT pg_class.oid, GREATEST(relpages, 1)
+FROM pg_class JOIN pg_namespace ON relnamespace = pg_namespace.oid
+WHERE nspname='%s' AND relname='%s'
+)",
+                                                         bind_data->schema_name, bind_data->table_name));
+  if (res->Count() != 1) {
+    throw InvalidInputException("Postgres table \"%s\".\"%s\" not found", bind_data->schema_name,
+                                bind_data->table_name);
+  }
+  auto oid = res->GetInt64(0, 0);
+  bind_data->pages_approx = res->GetInt64(0, 1);
+
+  res.reset();
+
+  // query the table schema so we can interpret the bits in the pages
+  // fun fact: this query also works in DuckDB ^^
+  res = PGQuery(bind_data->conn, StringUtil::Format(
+      R"(
+SELECT attname, attlen, attalign, attnotnull, atttypmod, typname, typtype
+FROM pg_attribute
+    JOIN pg_type ON atttypid=pg_type.oid
+WHERE attrelid=%d AND attnum > 0
+ORDER BY attnum
+)",
+      oid));
+
+  for (idx_t row = 0; row < res->Count(); row++) {
+    PostgresColumnInfo info;
+    info.attname = res->GetString(row, 0);
+    info.attlen = res->GetInt64(row, 1);
+    info.attalign = res->GetString(row, 2)[0];
+    info.attnotnull = res->GetString(row, 3) == "t";
+    info.atttypmod = res->GetInt32(row, 4);
+    info.typname = res->GetString(row, 5);
+    info.typtype = res->GetString(row, 6);
+
+    bind_data->names.push_back(info.attname);
+    bind_data->types.push_back(DuckDBType(info, bind_data->conn));
+
+    bind_data->columns.push_back(info);
+  }
+  res.reset();
+
+  return_types = bind_data->types;
+  names = bind_data->names;
+
+  return move(bind_data);
 }
 
 static string TransformFilter(string &column_name, TableFilter &filter);
@@ -936,10 +1028,21 @@ class PostgresScanFunction : public TableFunction {
 public:
 	PostgresScanFunction()
 	    : TableFunction("postgres_scan", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
-	                    PostgresScan, PostgresBind, PostgresInitGlobalState, PostgresInitLocalState) {
+                      PostgresScan, PostgresBind, PostgresInitGlobalState, PostgresInitLocalState) {
 		to_string = PostgresScanToString;
 		projection_pushdown = true;
 	}
+};
+
+class PGVectorFunction : public TableFunction {
+public:
+  PGVectorFunction()
+      : TableFunction("similarity",
+                      {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+                      PostgresScan, PGVectorBind, PostgresInitGlobalState, PostgresInitLocalState) {
+    to_string = PostgresScanToString;
+    projection_pushdown = true;
+  }
 };
 
 class PostgresScanFunctionFilterPushdown : public TableFunction {
@@ -963,6 +1066,10 @@ DUCKDB_EXTENSION_API void postgres_scanner_init(duckdb::DatabaseInstance &db) {
 	PostgresScanFunction postgres_fun;
 	CreateTableFunctionInfo postgres_info(postgres_fun);
 	catalog.CreateTableFunction(context, &postgres_info);
+
+  PGVectorFunction similarity_fun;
+  CreateTableFunctionInfo similarity_info(similarity_fun);
+  catalog.CreateTableFunction(context, &similarity_info);
 
 	PostgresScanFunctionFilterPushdown postgres_fun_filter_pushdown;
 	CreateTableFunctionInfo postgres_filter_pushdown_info(postgres_fun_filter_pushdown);
